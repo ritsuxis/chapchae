@@ -1,0 +1,23 @@
+syntax = "proto3";
+
+import "google/protobuf/timestamp.proto";
+option go_package = "github.com/ritsuxis/chapchae/chat/";
+
+package chat;
+
+service Chat {
+    rpc Stream(stream StreamRequest) returns (stream StreamResponse) {}
+}
+
+message StreamRequest {
+    string message = 2;
+}
+
+message StreamResponse {
+    google.protobuf.Timestamp timestamp = 1;
+    message Message {
+        string name = 1;
+        string message = 2;
+    }
+}
+
