@@ -50,9 +50,9 @@ func main() {
 	}
 
 	if err != nil {
-		tool.MessageLog(ctx, "Process", err.Error())
+		tool.MessageLogf(ctx, "Process", err.Error())
 		os.Exit(1)
 	}
 
-	tool.MessageLog(ctx, "Process", "byebye...")
+	tool.MessageLogf(ctx, "Process", "byebye...")
 }

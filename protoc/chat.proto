@@ -15,6 +15,11 @@ message StreamRequest {
 
 message StreamResponse {
     google.protobuf.Timestamp timestamp = 1;
+
+    oneof event {
+        Message client_message = 4;
+    }
+
     message Message {
         string name = 1;
         string message = 2;
