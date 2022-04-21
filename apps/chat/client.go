@@ -13,18 +13,21 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 )
 
 type client struct {
 	chat.ChatClient
-	Host, Name string
+	Host, Name, Password, Token string
+	Shutdown                    bool
 }
 
-func Client(host, username string) *client {
+func Client(host, pass, username string) *client {
 	return &client{
-		Host: host,
-		Name: username,
+		Host:     host,
+		Password: pass,
+		Name:     username,
 	}
 }
 
@@ -41,17 +44,24 @@ func (c *client) Run(ctx context.Context) error {
 
 	c.ChatClient = chat.NewChatClient(conn)
 
-	// TODO: login process
+	if c.Token, err = c.login(ctx); err != nil {
+		return errors.WithMessage(err, "failed to login")
+	}
+	tool.ClientLogf("logged in successfully")
 
 	err = c.stream(ctx)
 
-	// TODO: logout
+	tool.ClientLogf("logging out")
+	if err := c.logout(ctx); err != nil {
+		tool.ClientLogf("failed to log out: " + err.Error())
+	}
 
 	return errors.WithMessage(err, "stream error")
 }
 
 func (c *client) stream(ctx context.Context) error {
-	// TODO: token
+	md := metadata.New(map[string]string{tokenHeader: c.Token})
+	ctx = metadata.NewOutgoingContext(ctx, md)
 
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -62,7 +72,7 @@ func (c *client) stream(ctx context.Context) error {
 	}
 	defer client.CloseSend()
 
-	tool.ClientLogf(ctx, "connected to stream")
+	tool.ClientLogf("connected to stream")
 
 	go c.send(client)
 	return c.receive(client)
@@ -73,29 +83,29 @@ func (c *client) receive(sc chat.Chat_StreamClient) error {
 		res, err := sc.Recv()
 
 		if s, ok := status.FromError(err); ok && s.Code() == codes.Canceled {
-			tool.DebugLogf(sc.Context(), "stream canceled (usually indicates shutdown)")
+			tool.DebugLogf("stream canceled (usually indicates shutdown)")
 			return nil
 		} else if err == io.EOF {
-			tool.DebugLogf(sc.Context(), "stream closed by server")
+			tool.DebugLogf("stream closed by server")
 			return nil
 		} else if err != nil {
 			return err
 		}
 
 		switch evt := res.Event.(type) {
-		// case *chat.StreamResponse_ClientLogin:
-		// 	tool.ServerLogf(ts, "%s has logged in", evt.ClientLogin.Name)
-		// case *chat.StreamResponse_ClientLogout:
-		// 	tool.ServerLogf(ts, "%s has logged out", evt.ClientLogout.Name)
+		case *chat.StreamResponse_ClientLogin:
+			tool.ServerLogf("%s has logged in", evt.ClientLogin.Name)
+		case *chat.StreamResponse_ClientLogout:
+			tool.ServerLogf("%s has logged out", evt.ClientLogout.Name)
 		case *chat.StreamResponse_ClientMessage:
-			tool.MessageLogf(sc.Context(), evt.ClientMessage.Name, evt.ClientMessage.Message)
-			// case *chat.StreamResponse_ServerShutdown:
-			// 	tool.ServerLogf(ts, "the server is shutting down")
-			// 	c.Shutdown = true
-			// 	return nil
-			// default:
-			// 	ClientLogf(ts, "unexpected event from the server: %T", evt)
-			// 	return nil
+			tool.MessageLogf(evt.ClientMessage.Name, evt.ClientMessage.Message)
+		case *chat.StreamResponse_ServerShutdown:
+			tool.ServerLogf("the server is shutting down")
+			c.Shutdown = true
+			return nil
+		default:
+			tool.ClientLogf("unexpected event from the server: %T", evt)
+			return nil
 		}
 	}
 }
@@ -108,18 +118,52 @@ func (c *client) send(client chat.Chat_StreamClient) {
 	for {
 		select {
 		case <-client.Context().Done():
-			tool.DebugLogf(client.Context(), "client send loop disconnected")
+			tool.DebugLogf("client send loop disconnected")
 		default:
 			if sc.Scan() {
 				// send message
 				if err := client.Send(&chat.StreamRequest{Message: sc.Text()}); err != nil {
-					tool.ClientLogf(client.Context(), "failed to send message: "+err.Error())
+					tool.ClientLogf("failed to send message: " + err.Error())
 					return
 				}
 			} else {
-				tool.ClientLogf(client.Context(), "input scanner failure: "+sc.Err().Error())
+				tool.ClientLogf("input scanner failure: " + sc.Err().Error())
 				return
 			}
 		}
 	}
+}
+
+func (c *client) login(ctx context.Context) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, time.Second)
+	defer cancel()
+
+	res, err := c.ChatClient.Login(ctx, &chat.LoginRequest{
+		Name:     c.Name,
+		Password: c.Password,
+	})
+
+	if err != nil {
+		return "", err
+	}
+
+	return res.Token, nil
+}
+
+func (c *client) logout(_ context.Context) error {
+	if c.Shutdown {
+		tool.DebugLogf("unable to logout (server sent shutdown signal)")
+		return nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	_, err := c.ChatClient.Logout(ctx, &chat.LogoutRequest{Token: c.Token})
+	if s, ok := status.FromError(err); ok && s.Code() == codes.Unavailable {
+		tool.DebugLogf("unable to logout (connection already closed)")
+		return nil
+	}
+
+	return err
 }

@@ -2,32 +2,44 @@ package chat
 
 import (
 	"context"
+	"fmt"
+	"io"
+	"math/rand"
+	"net"
 	"sync"
 
+	"github.com/pkg/errors"
 	chat "github.com/ritsuxis/chapchae/protoc"
 	tool "github.com/ritsuxis/chapchae/tools"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
+
+const tokenHeader = "x-chat-token"
 
 type server struct {
 	chat.UnimplementedChatServer
-	Host string
+	Host, Password string
 
 	Broadcast chan *chat.StreamResponse
 
-	ClientNames map[string]string
+	ClientNames   map[string]string
 	ClientStreams map[string]chan *chat.StreamResponse
 
 	namesMtx, streamsMtx sync.RWMutex
 }
 
-func Server(host string) *server {
+func Server(host, pass string) *server {
 	return &server{
-		Host: host,
+		Host:     host,
+		Password: pass,
 
 		Broadcast: make(chan *chat.StreamResponse, 1000),
 
-		ClientNames: make(map[string]string),
+		ClientNames:   make(map[string]string),
 		ClientStreams: make(map[string]chan *chat.StreamResponse),
 	}
 }
@@ -36,14 +48,215 @@ func (s *server) Run(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	tool.ServerLogf(ctx, "starting on " + s.Host)
+	tool.ServerLogf("starting on " + s.Host + " with password " + s.Password)
 
 	srv := grpc.NewServer()
 	chat.RegisterChatServer(srv, s)
 
+	l, err := net.Listen("tcp", s.Host)
+	if err != nil {
+		return errors.WithMessage(err, "server unable to bind on provided host")
+	}
+
+	go s.broadcast(ctx)
+
+	go func() {
+		_ = srv.Serve(l)
+		cancel()
+	}()
+
+	<-ctx.Done()
+
+	s.Broadcast <- &chat.StreamResponse{
+		Timestamp: timestamppb.Now(),
+		Event: &chat.StreamResponse_ServerShutdown{
+			ServerShutdown: &chat.StreamResponse_Shutdown{},
+		},
+	}
+
+	close(s.Broadcast)
+	tool.ServerLogf("shutting down")
+
+	srv.GracefulStop()
 	return nil
 }
 
+func (s *server) Login(_ context.Context, req *chat.LoginRequest) (*chat.LoginResponse, error) {
+	switch {
+	case req.Password != s.Password:
+		return nil, status.Error(codes.Unauthenticated, "password is incorrect")
+	case req.Name == "":
+		return nil, status.Error(codes.InvalidArgument, "username is required")
+	}
+
+	tkn := s.genToken()
+	s.setName(tkn, req.Name)
+
+	tool.ServerLogf("%s (%s) has logged in", tkn, req.Name)
+
+	s.Broadcast <- &chat.StreamResponse{
+		Timestamp: timestamppb.Now(),
+		Event: &chat.StreamResponse_ClientLogin{ClientLogin: &chat.StreamResponse_Login{
+			Name: req.Name,
+		}},
+	}
+
+	return &chat.LoginResponse{Token: tkn}, nil
+}
+
+func (s *server) Logout(_ context.Context, req *chat.LogoutRequest) (*chat.LogoutResponse, error) {
+	name, ok := s.delName(req.Token)
+	if !ok {
+		return nil, status.Error(codes.NotFound, "token not found")
+	}
+
+	tool.ServerLogf("%s (%s) has logged out", req.Token, name)
+
+	s.Broadcast <- &chat.StreamResponse{
+		Timestamp: timestamppb.Now(),
+		Event: &chat.StreamResponse_ClientLogout{ClientLogout: &chat.StreamResponse_Logout{
+			Name: name,
+		}},
+	}
+
+	return new(chat.LogoutResponse), nil
+}
+
 func (s *server) Stream(srv chat.Chat_StreamServer) error {
-	return nil
+	tkn, ok := s.extractToken(srv.Context())
+	if !ok {
+		return status.Error(codes.Unauthenticated, "missing token header")
+	}
+
+	name, ok := s.getName(tkn)
+	if !ok {
+		return status.Error(codes.Unauthenticated, "invalid token")
+	}
+
+	go s.sendBroadcasts(srv, tkn)
+
+	for {
+		req, err := srv.Recv()
+		if err == io.EOF {
+			break
+		} else if err != nil {
+			return err
+		}
+
+		s.Broadcast <- &chat.StreamResponse{
+			Timestamp: timestamppb.Now(),
+			Event: &chat.StreamResponse_ClientMessage{ClientMessage: &chat.StreamResponse_Message{
+				Name:    name,
+				Message: req.Message,
+			}},
+		}
+	}
+
+	<-srv.Context().Done()
+	return srv.Context().Err()
+}
+
+func (s *server) sendBroadcasts(srv chat.Chat_StreamServer, tkn string) {
+	stream := s.openStream(srv, tkn)
+	defer s.closeStream(srv, tkn)
+
+	for {
+		select {
+		case <-srv.Context().Done():
+			return
+		case res := <-stream:
+			if s, ok := status.FromError(srv.Send(res)); ok {
+				switch s.Code() {
+				case codes.OK:
+					// noop
+				case codes.Unavailable, codes.Canceled, codes.DeadlineExceeded:
+					tool.DebugLogf("client (" + tkn + ") terminated connection")
+					return
+				default:
+					tool.ClientLogf("failed to send to client (" + tkn + "): " + s.Err().Error())
+					return
+				}
+			}
+		}
+	}
+}
+
+func (s *server) broadcast(c context.Context) {
+	for res := range s.Broadcast {
+		s.streamsMtx.RLock()
+		for _, stream := range s.ClientStreams {
+			select {
+			case stream <- res:
+				// noop
+			default:
+				tool.ServerLogf("client stream full, dropping message")
+			}
+		}
+		s.streamsMtx.RUnlock()
+	}
+}
+
+func (s *server) openStream(srv chat.Chat_StreamServer, tkn string) (stream chan *chat.StreamResponse) {
+	stream = make(chan *chat.StreamResponse, 100)
+
+	s.streamsMtx.Lock()
+	s.ClientStreams[tkn] = stream
+	s.streamsMtx.Unlock()
+
+	tool.DebugLogf("opened stream for client " + tkn)
+
+	return
+}
+
+func (s *server) closeStream(srv chat.Chat_StreamServer, tkn string) {
+	s.streamsMtx.Lock()
+
+	if stream, ok := s.ClientStreams[tkn]; ok {
+		delete(s.ClientStreams, tkn)
+		close(stream)
+	}
+
+	tool.DebugLogf("closed stream for client " + tkn)
+
+	s.streamsMtx.Unlock()
+}
+
+func (s *server) genToken() string {
+	tkn := make([]byte, 4)
+	rand.Read(tkn) // 多分替えたほうがいい
+	return fmt.Sprintf("%x", tkn)
+}
+
+func (s *server) getName(tkn string) (name string, ok bool) {
+	s.namesMtx.RLock()
+	name, ok = s.ClientNames[tkn]
+	s.namesMtx.RUnlock()
+	return
+}
+
+func (s *server) setName(tkn string, name string) {
+	s.namesMtx.Lock()
+	s.ClientNames[tkn] = name
+	s.namesMtx.Unlock()
+}
+
+func (s *server) delName(tkn string) (name string, ok bool) {
+	name, ok = s.getName(tkn)
+
+	if ok {
+		s.namesMtx.Lock()
+		delete(s.ClientNames, tkn)
+		s.namesMtx.Unlock()
+	}
+
+	return
+}
+
+func (s *server) extractToken(ctx context.Context) (tkn string, ok bool) {
+	md, ok := metadata.FromIncomingContext(ctx)
+	if !ok || len(md[tokenHeader]) == 0 {
+		return "", false
+	}
+
+	return md[tokenHeader][0], true
 }
